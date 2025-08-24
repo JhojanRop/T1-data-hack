@@ -1,0 +1,27 @@
+# Archivos compilados
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Archivos de logs y salida
+*.log
+*.out
+*.err
+
+# Entornos virtuales
+.env
+.venv
+env/
+venv/
+nlp_env/
+
+# Carpetas de conda env
+conda_env/
+*.conda
+*.condarc
+*.conda-lock
+
+.ipynb_checkpoints/
+en_core_*
