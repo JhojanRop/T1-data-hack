@@ -218,7 +218,7 @@ class EmbeddingAnalyzer:
         plt.tight_layout()
         plt.show()
         
-        print(f"Estadísticas de normas:")
+        print("Estadísticas de normas:")
         print(f"  Media: {norms.mean():.4f}")
         print(f"  Std: {norms.std():.4f}")
         print(f"  Min: {norms.min():.4f}")
@@ -256,7 +256,7 @@ class EmbeddingAnalyzer:
         
         # Estadísticas de similitud
         upper_triangle = sim_matrix[np.triu_indices_from(sim_matrix, k=1)]
-        print(f"Estadísticas de similitud coseno:")
+        print("Estadísticas de similitud coseno:")
         print(f"  Media: {upper_triangle.mean():.4f}")
         print(f"  Std: {upper_triangle.std():.4f}")
         print(f"  Min: {upper_triangle.min():.4f}")
