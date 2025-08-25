@@ -1,477 +1,369 @@
 """
-Clasificador híbrido que combina embeddings biomédicos, NER y enriquecimiento semántico
+Enriquecimiento semántico usando diccionarios biomédicos
+FDA, OMS/WHO, INVIMA y otros vocabularios controlados
 """
 
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
-from sklearn.multiclass import OneVsRestClassifier
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
-import xgboost as xgb
-import lightgbm as lgb
-from typing import List, Dict, Tuple, Optional, Union
+import re
+from collections import defaultdict
+from typing import List, Dict, Set, Tuple
 import logging
-import pickle
-from pathlib import Path
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# Importar nuestros módulos
-from ..features.biomedical_embeddings import BiomedicalEmbeddings
-from ..features.biomedical_ner import BiomedicalNER, MeSHMapper
-from ..features.semantic_enrichment import SemanticEnrichment, ClinicalTrialEnrichment
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class HybridBiomedicalClassifier:
+class SemanticEnrichment:
     """
-    Clasificador híbrido que combina múltiples fuentes de información biomédica
+    Enriquecedor semántico usando diccionarios biomédicos especializados
     """
     
-    def __init__(self, 
-                 embedding_model: str = "all-MiniLM-L6-v2",
-                 ner_model: str = "en_core_sci_sm",
-                 classifier_type: str = "xgboost",
-                 use_embeddings: bool = True,
-                 use_ner: bool = True,
-                 use_semantic: bool = True,
-                 use_mesh: bool = True,
-                 use_clinical_trials: bool = True):
+    def __init__(self):
         """
-        Inicializa el clasificador híbrido
-        
-        Args:
-            embedding_model: Modelo para embeddings
-            ner_model: Modelo para NER biomédico
-            classifier_type: 'xgboost' o 'lightgbm'
-            use_embeddings: Usar embeddings biomédicos
-            use_ner: Usar features de NER
-            use_semantic: Usar enriquecimiento semántico
-            use_mesh: Usar mapeo a MeSH
-            use_clinical_trials: Usar features de ensayos clínicos
+        Inicializa los diccionarios biomédicos
         """
-        self.embedding_model = embedding_model
-        self.ner_model = ner_model
-        self.classifier_type = classifier_type
+        logger.info("Inicializando diccionarios biomédicos...")
         
-        # Configuración de componentes
-        self.use_embeddings = use_embeddings
-        self.use_ner = use_ner
-        self.use_semantic = use_semantic
-        self.use_mesh = use_mesh
-        self.use_clinical_trials = use_clinical_trials
+        # Diccionarios farmacológicos y médicos
+        self._load_dictionaries()
         
-        # Inicializar componentes
-        self._initialize_components()
-        
-        # Objetos de entrenamiento
-        self.mlb = MultiLabelBinarizer()
-        self.scaler = StandardScaler()
-        self.classifier = None
-        self.feature_names = []
-        
-        logger.info("✅ HybridBiomedicalClassifier inicializado")
-        self._log_configuration()
+        logger.info("✅ Diccionarios cargados exitosamente")
+        logger.info(f"  - FDA terms: {len(self.fda_terms)}")
+        logger.info(f"  - WHO terms: {len(self.who_terms)}")
+        logger.info(f"  - INVIMA terms: {len(self.invima_terms)}")
+        logger.info(f"  - Disease terms: {len(self.disease_terms)}")
+        logger.info(f"  - Drug terms: {len(self.drug_terms)}")
     
-    def _initialize_components(self):
-        """Inicializa los componentes según la configuración"""
-        self.components = {}
-        
-        if self.use_embeddings:
-            try:
-                self.components['embeddings'] = BiomedicalEmbeddings(self.embedding_model)
-                logger.info("✅ Componente de embeddings inicializado")
-            except Exception as e:
-                logger.warning(f"⚠️ Error inicializando embeddings: {e}")
-                self.use_embeddings = False
-        
-        if self.use_ner or self.use_mesh:
-            try:
-                self.components['ner'] = BiomedicalNER(self.ner_model)
-                logger.info("✅ Componente de NER inicializado")
-                
-                if self.use_mesh:
-                    self.components['mesh'] = MeSHMapper()
-                    logger.info("✅ Componente MeSH inicializado")
-            except Exception as e:
-                logger.warning(f"⚠️ Error inicializando NER: {e}")
-                self.use_ner = False
-                self.use_mesh = False
-        
-        if self.use_semantic:
-            try:
-                self.components['semantic'] = SemanticEnrichment()
-                logger.info("✅ Componente semántico inicializado")
-            except Exception as e:
-                logger.warning(f"⚠️ Error inicializando enriquecimiento semántico: {e}")
-                self.use_semantic = False
-        
-        if self.use_clinical_trials:
-            try:
-                self.components['clinical'] = ClinicalTrialEnrichment()
-                logger.info("✅ Componente de ensayos clínicos inicializado")
-            except Exception as e:
-                logger.warning(f"⚠️ Error inicializando ensayos clínicos: {e}")
-                self.use_clinical_trials = False
-    
-    def _log_configuration(self):
-        """Log de la configuración actual"""
-        logger.info("Configuración del clasificador híbrido:")
-        logger.info(f"  - Embeddings: {'✅' if self.use_embeddings else '❌'}")
-        logger.info(f"  - NER biomédico: {'✅' if self.use_ner else '❌'}")
-        logger.info(f"  - Enriquecimiento semántico: {'✅' if self.use_semantic else '❌'}")
-        logger.info(f"  - Mapeo MeSH: {'✅' if self.use_mesh else '❌'}")
-        logger.info(f"  - Ensayos clínicos: {'✅' if self.use_clinical_trials else '❌'}")
-        logger.info(f"  - Clasificador: {self.classifier_type}")
-    
-    def extract_features(self, df: pd.DataFrame, 
-                        title_col: str = 'title', 
-                        abstract_col: str = 'abstract') -> np.ndarray:
+    def _load_dictionaries(self):
         """
-        Extrae todas las features configuradas
-        
-        Args:
-            df: DataFrame con los datos
-            title_col: Columna de títulos
-            abstract_col: Columna de abstracts
-            
-        Returns:
-            Array de features combinadas
+        Carga los diccionarios especializados
+        En producción, estos vendrían de APIs oficiales o bases de datos actualizadas
         """
-        logger.info(f"Extrayendo features de {len(df)} documentos...")
         
-        feature_matrices = []
-        feature_names = []
-        
-        # Combinar título y abstract
-        combined_texts = []
-        for _, row in df.iterrows():
-            title = row[title_col] if pd.notna(row[title_col]) else ""
-            abstract = row[abstract_col] if pd.notna(row[abstract_col]) else ""
-            combined_texts.append(f"{title}. {abstract}")
-        
-        # 1. Embeddings biomédicos
-        if self.use_embeddings and 'embeddings' in self.components:
-            logger.info("Extrayendo embeddings biomédicos...")
-            embeddings = self.components['embeddings'].extract_embeddings(combined_texts)
-            feature_matrices.append(embeddings)
+        # Términos FDA (Food and Drug Administration)
+        self.fda_terms = {
+            # Categorías de medicamentos FDA
+            'antibiotic', 'antiviral', 'antifungal', 'antihistamine',
+            'analgesic', 'anti-inflammatory', 'immunosuppressant',
+            'chemotherapy', 'biologic', 'biosimilar', 'orphan drug',
+            'clinical trial', 'phase i', 'phase ii', 'phase iii',
+            'adverse event', 'side effect', 'contraindication',
+            'dosage', 'pharmacokinetics', 'bioavailability',
+            'fda approved', 'breakthrough therapy', 'fast track',
             
-            # Nombres de features para embeddings
-            embed_names = [f'embed_{i}' for i in range(embeddings.shape[1])]
-            feature_names.extend(embed_names)
+            # Dispositivos médicos
+            'medical device', 'diagnostic', 'therapeutic device',
+            'implant', 'prosthetic', 'pacemaker', 'stent',
             
-            logger.info(f"✅ Embeddings: {embeddings.shape}")
-        
-        # 2. Features de NER biomédico
-        if self.use_ner and 'ner' in self.components:
-            logger.info("Extrayendo features de NER biomédico...")
-            entities_list = self.components['ner'].extract_from_corpus(combined_texts)
-            ner_features = self.components['ner'].create_entity_features(entities_list)
-            
-            feature_matrices.append(ner_features.values)
-            feature_names.extend([f'ner_{col}' for col in ner_features.columns])
-            
-            logger.info(f"✅ Features NER: {ner_features.shape}")
-            
-            # 3. Features MeSH
-            if self.use_mesh and 'mesh' in self.components:
-                logger.info("Extrayendo features MeSH...")
-                mesh_features = self.components['mesh'].create_mesh_features(entities_list)
-                
-                feature_matrices.append(mesh_features.values)
-                feature_names.extend([f'mesh_{col}' for col in mesh_features.columns])
-                
-                logger.info(f"✅ Features MeSH: {mesh_features.shape}")
-        
-        # 4. Enriquecimiento semántico
-        if self.use_semantic and 'semantic' in self.components:
-            logger.info("Extrayendo features semánticas...")
-            semantic_features = self.components['semantic'].extract_from_corpus(combined_texts)
-            
-            feature_matrices.append(semantic_features.values)
-            feature_names.extend([f'semantic_{col}' for col in semantic_features.columns])
-            
-            logger.info(f"✅ Features semánticas: {semantic_features.shape}")
-        
-        # 5. Features de ensayos clínicos
-        if self.use_clinical_trials and 'clinical' in self.components:
-            logger.info("Extrayendo features de ensayos clínicos...")
-            clinical_features = []
-            
-            for text in combined_texts:
-                features = self.components['clinical'].extract_trial_features(text)
-                clinical_features.append(features)
-            
-            clinical_df = pd.DataFrame(clinical_features)
-            feature_matrices.append(clinical_df.values)
-            feature_names.extend([f'clinical_{col}' for col in clinical_df.columns])
-            
-            logger.info(f"✅ Features ensayos clínicos: {clinical_df.shape}")
-        
-        # Combinar todas las features
-        if feature_matrices:
-            combined_features = np.hstack(feature_matrices)
-            self.feature_names = feature_names
-            
-            logger.info(f"✅ Features combinadas: {combined_features.shape}")
-            return combined_features
-        else:
-            raise ValueError("No se pudieron extraer features. Verifique la configuración.")
-    
-    def _get_classifier(self):
-        """Obtiene el clasificador configurado"""
-        if self.classifier_type.lower() == 'xgboost':
-            base_classifier = xgb.XGBClassifier(
-                objective='binary:logistic',
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                random_state=42,
-                eval_metric='logloss'
-            )
-        elif self.classifier_type.lower() == 'lightgbm':
-            base_classifier = lgb.LGBMClassifier(
-                objective='binary',
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                random_state=42,
-                verbosity=-1
-            )
-        else:
-            raise ValueError(f"Clasificador no soportado: {self.classifier_type}")
-        
-        return OneVsRestClassifier(base_classifier)
-    
-    def train(self, df: pd.DataFrame, 
-              title_col: str = 'title',
-              abstract_col: str = 'abstract', 
-              label_col: str = 'group') -> Dict:
-        """
-        Entrena el clasificador híbrido
-        
-        Args:
-            df: DataFrame con los datos
-            title_col: Columna de títulos
-            abstract_col: Columna de abstracts
-            label_col: Columna de etiquetas
-            
-        Returns:
-            Diccionario con métricas de entrenamiento
-        """
-        logger.info("Iniciando entrenamiento del clasificador híbrido...")
-        
-        # Extraer features
-        X = self.extract_features(df, title_col, abstract_col)
-        
-        # Preparar etiquetas
-        labels = df[label_col].tolist()
-        y = self.mlb.fit_transform(labels)
-        
-        logger.info(f"Etiquetas: {y.shape}, Clases: {len(self.mlb.classes_)}")
-        
-        # Escalar features
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Entrenar clasificador
-        self.classifier = self._get_classifier()
-        self.classifier.fit(X_scaled, y)
-        
-        logger.info("✅ Entrenamiento completado")
-        
-        # Evaluar en datos de entrenamiento
-        y_pred = self.classifier.predict(X_scaled)
-        
-        metrics = {}
-        for avg_type in ['micro', 'macro', 'weighted']:
-            score = f1_score(y, y_pred, average=avg_type, zero_division=0)
-            metrics[f'f1_{avg_type}'] = score
-        
-        return metrics
-    
-    def cross_validate(self, df: pd.DataFrame,
-                      title_col: str = 'title',
-                      abstract_col: str = 'abstract', 
-                      label_col: str = 'group',
-                      cv_folds: int = 5) -> Dict:
-        """
-        Realiza validación cruzada
-        
-        Args:
-            df: DataFrame con los datos
-            title_col: Columna de títulos  
-            abstract_col: Columna de abstracts
-            label_col: Columna de etiquetas
-            cv_folds: Número de folds
-            
-        Returns:
-            Diccionario con métricas de validación cruzada
-        """
-        logger.info(f"Iniciando validación cruzada con {cv_folds} folds...")
-        
-        # Extraer features
-        X = self.extract_features(df, title_col, abstract_col)
-        
-        # Preparar etiquetas
-        labels = df[label_col].tolist()
-        y = self.mlb.fit_transform(labels)
-        
-        # Escalar features
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Validación cruzada manual para multilabel
-        kf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        
-        # Para StratifiedKFold con multilabel, usar la clase más frecuente por muestra
-        y_single = np.argmax(y, axis=1)
-        
-        cv_scores = {
-            'f1_micro': [],
-            'f1_macro': [],
-            'f1_weighted': []
+            # Seguridad alimentaria
+            'food safety', 'contamination', 'recall', 'inspection',
+            'gmp', 'good manufacturing practice'
         }
         
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X_scaled, y_single)):
-            logger.info(f"Procesando fold {fold + 1}/{cv_folds}")
+        # Términos OMS/WHO (World Health Organization)
+        self.who_terms = {
+            # Clasificaciones WHO
+            'icd-10', 'icd-11', 'who classification',
+            'essential medicines', 'global health',
+            'pandemic', 'epidemic', 'outbreak',
+            'surveillance', 'public health emergency',
             
-            X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
+            # Enfermedades prioritarias WHO
+            'tuberculosis', 'malaria', 'hiv', 'aids',
+            'hepatitis', 'cholera', 'yellow fever',
+            'zika', 'ebola', 'sars', 'mers',
+            'antimicrobial resistance', 'superbugs',
             
-            # Entrenar
-            classifier = self._get_classifier()
-            classifier.fit(X_train, y_train)
-            
-            # Predecir
-            y_pred = classifier.predict(X_val)
-            
-            # Calcular métricas
-            for avg_type in ['micro', 'macro', 'weighted']:
-                score = f1_score(y_val, y_pred, average=avg_type, zero_division=0)
-                cv_scores[f'f1_{avg_type}'].append(score)
-        
-        # Calcular estadísticas
-        results = {}
-        for metric, scores in cv_scores.items():
-            results[f'{metric}_mean'] = np.mean(scores)
-            results[f'{metric}_std'] = np.std(scores)
-        
-        logger.info("✅ Validación cruzada completada")
-        return results
-    
-    def get_feature_importance(self, top_n: int = 20) -> pd.DataFrame:
-        """
-        Obtiene la importancia de las features
-        
-        Args:
-            top_n: Número de features top a retornar
-            
-        Returns:
-            DataFrame con importancia de features
-        """
-        if self.classifier is None:
-            raise ValueError("El modelo debe estar entrenado primero")
-        
-        # Obtener importancias de todos los clasificadores binarios
-        importances = []
-        
-        for i, estimator in enumerate(self.classifier.estimators_):
-            if hasattr(estimator, 'feature_importances_'):
-                importances.append(estimator.feature_importances_)
-        
-        if not importances:
-            logger.warning("El clasificador no proporciona importancia de features")
-            return pd.DataFrame()
-        
-        # Promediar importancias
-        avg_importance = np.mean(importances, axis=0)
-        
-        # Crear DataFrame
-        importance_df = pd.DataFrame({
-            'feature': self.feature_names[:len(avg_importance)],
-            'importance': avg_importance
-        }).sort_values('importance', ascending=False)
-        
-        return importance_df.head(top_n)
-    
-    def save_model(self, filepath: str):
-        """Guarda el modelo entrenado"""
-        model_data = {
-            'classifier': self.classifier,
-            'mlb': self.mlb,
-            'scaler': self.scaler,
-            'feature_names': self.feature_names,
-            'config': {
-                'embedding_model': self.embedding_model,
-                'ner_model': self.ner_model,
-                'classifier_type': self.classifier_type,
-                'use_embeddings': self.use_embeddings,
-                'use_ner': self.use_ner,
-                'use_semantic': self.use_semantic,
-                'use_mesh': self.use_mesh,
-                'use_clinical_trials': self.use_clinical_trials
-            }
+            # Programas WHO
+            'immunization', 'vaccination', 'eradication',
+            'health systems', 'universal health coverage',
+            'neglected diseases', 'maternal health',
+            'child mortality', 'nutrition'
         }
         
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_data, f)
-        
-        logger.info(f"✅ Modelo guardado en: {filepath}")
-    
-    def load_model(self, filepath: str):
-        """Carga un modelo previamente entrenado"""
-        with open(filepath, 'rb') as f:
-            model_data = pickle.load(f)
-        
-        self.classifier = model_data['classifier']
-        self.mlb = model_data['mlb']
-        self.scaler = model_data['scaler']
-        self.feature_names = model_data['feature_names']
-        
-        # Restaurar configuración
-        config = model_data['config']
-        self.embedding_model = config['embedding_model']
-        self.ner_model = config['ner_model']
-        self.classifier_type = config['classifier_type']
-        self.use_embeddings = config['use_embeddings']
-        self.use_ner = config['use_ner']
-        self.use_semantic = config['use_semantic']
-        self.use_mesh = config['use_mesh']
-        self.use_clinical_trials = config['use_clinical_trials']
-        
-        # Reinicializar componentes
-        self._initialize_components()
-        
-        logger.info(f"✅ Modelo cargado desde: {filepath}")
-
-
-def compare_models(baseline_scores: Dict, hybrid_scores: Dict) -> pd.DataFrame:
-    """
-    Compara las métricas del baseline vs híbrido
-    
-    Args:
-        baseline_scores: Métricas del modelo baseline
-        hybrid_scores: Métricas del modelo híbrido
-        
-    Returns:
-        DataFrame con comparación
-    """
-    comparison = []
-    
-    for metric in baseline_scores.keys():
-        if metric in hybrid_scores:
-            baseline_val = baseline_scores[metric]
-            hybrid_val = hybrid_scores[metric]
-            improvement = hybrid_val - baseline_val
-            improvement_pct = (improvement / baseline_val) * 100 if baseline_val > 0 else 0
+        # Términos INVIMA (Instituto Nacional de Vigilancia de Medicamentos)
+        self.invima_terms = {
+            # Regulación Colombia
+            'registro sanitario', 'farmacovigilancia',
+            'reacciones adversas', 'medicamento generico',
+            'biosimilar', 'fitoterapeutico',
+            'suplemento dietario', 'dispositivo medico',
+            'cosmetico', 'alimento', 'bebida alcoholica',
             
-            comparison.append({
-                'metric': metric,
-                'baseline': baseline_val,
-                'hybrid': hybrid_val,
-                'improvement': improvement,
-                'improvement_pct': improvement_pct
+            # Procesos regulatorios
+            'buenas practicas', 'inspeccion', 'certificacion',
+            'autorizacion', 'licencia', 'permiso',
+            'vigilancia sanitaria', 'control calidad',
+            
+            # Categorías productos
+            'medicamento vital no disponible', 'mvnd',
+            'principio activo', 'excipiente',
+            'forma farmaceutica', 'concentracion'
+        }
+        
+        # Diccionario de enfermedades expandido
+        self.disease_terms = {
+            # Cardiovasculares
+            'hypertension', 'heart disease', 'myocardial infarction',
+            'stroke', 'arrhythmia', 'heart failure', 'angina',
+            'atherosclerosis', 'cardiomyopathy',
+            
+            # Cáncer
+            'cancer', 'tumor', 'malignancy', 'carcinoma',
+            'sarcoma', 'lymphoma', 'leukemia', 'metastasis',
+            'oncology', 'chemotherapy', 'radiation therapy',
+            
+            # Neurológicas
+            'alzheimer', 'parkinson', 'epilepsy', 'stroke',
+            'multiple sclerosis', 'depression', 'anxiety',
+            'schizophrenia', 'bipolar', 'dementia',
+            
+            # Infecciosas
+            'infection', 'bacteria', 'virus', 'fungus',
+            'pneumonia', 'sepsis', 'meningitis',
+            'covid-19', 'influenza', 'respiratory infection',
+            
+            # Metabólicas
+            'diabetes', 'obesity', 'metabolic syndrome',
+            'thyroid disease', 'cholesterol', 'lipid disorder',
+            
+            # Inmunológicas
+            'autoimmune', 'allergy', 'asthma', 'arthritis',
+            'lupus', 'inflammatory bowel', 'psoriasis'
+        }
+        
+        # Diccionario de medicamentos expandido
+        self.drug_terms = {
+            # Clases terapéuticas
+            'ace inhibitor', 'beta blocker', 'calcium channel blocker',
+            'diuretic', 'statin', 'anticoagulant', 'antiplatelet',
+            'proton pump inhibitor', 'selective serotonin reuptake inhibitor',
+            'nsaid', 'corticosteroid', 'immunosuppressant',
+            
+            # Antibióticos
+            'penicillin', 'cephalosporin', 'fluoroquinolone',
+            'macrolide', 'tetracycline', 'aminoglycoside',
+            'carbapenem', 'vancomycin',
+            
+            # Antivirales
+            'acyclovir', 'oseltamivir', 'ritonavir',
+            'interferon', 'nucleoside analog',
+            
+            # Quimioterapia
+            'cisplatin', 'doxorubicin', 'paclitaxel',
+            'carboplatin', 'cyclophosphamide', 'methotrexate',
+            
+            # Formas farmacéuticas
+            'tablet', 'capsule', 'injection', 'infusion',
+            'topical', 'transdermal', 'inhalation', 'suppository'
+        }
+        
+        # Compilar patrones de regex para búsqueda eficiente
+        self._compile_patterns()
+    
+    def _compile_patterns(self):
+        """
+        Compila patrones de regex para búsqueda eficiente
+        """
+        self.patterns = {}
+        
+        for dict_name, terms in [
+            ('fda', self.fda_terms),
+            ('who', self.who_terms), 
+            ('invima', self.invima_terms),
+            ('disease', self.disease_terms),
+            ('drug', self.drug_terms)
+        ]:
+            # Crear patrón que busca términos completos
+            pattern = r'\b(?:' + '|'.join(re.escape(term) for term in terms) + r')\b'
+            self.patterns[dict_name] = re.compile(pattern, re.IGNORECASE)
+    
+    def extract_dictionary_features(self, text: str) -> Dict[str, int]:
+        """
+        Extrae features basadas en diccionarios de un texto
+        
+        Args:
+            text: Texto a analizar
+            
+        Returns:
+            Diccionario con conteos por diccionario
+        """
+        if pd.isna(text) or text.strip() == "":
+            return {dict_name: 0 for dict_name in self.patterns.keys()}
+        
+        features = {}
+        text_lower = text.lower()
+        
+        for dict_name, pattern in self.patterns.items():
+            matches = pattern.findall(text_lower)
+            features[f'{dict_name}_terms'] = len(matches)
+            features[f'{dict_name}_unique_terms'] = len(set(matches))
+        
+        # Features adicionales
+        total_terms = sum(features[k] for k in features.keys() if k.endswith('_terms'))
+        features['total_dict_terms'] = total_terms
+        
+        # Ratios
+        if total_terms > 0:
+            for dict_name in self.patterns.keys():
+                count = features[f'{dict_name}_terms']
+                features[f'{dict_name}_ratio'] = count / total_terms
+        else:
+            for dict_name in self.patterns.keys():
+                features[f'{dict_name}_ratio'] = 0.0
+        
+        return features
+    
+    def extract_from_corpus(self, texts: List[str]) -> pd.DataFrame:
+        """
+        Extrae features de diccionarios de un corpus
+        
+        Args:
+            texts: Lista de textos
+            
+        Returns:
+            DataFrame con features de diccionarios
+        """
+        logger.info(f"Extrayendo features de diccionarios de {len(texts)} textos...")
+        
+        features_list = []
+        for text in texts:
+            features = self.extract_dictionary_features(text)
+            features_list.append(features)
+        
+        df_features = pd.DataFrame(features_list)
+        
+        logger.info(f"✅ Features extraídas: {df_features.shape}")
+        return df_features
+    
+    def get_matched_terms(self, text: str) -> Dict[str, List[str]]:
+        """
+        Obtiene los términos específicos que coincidieron en cada diccionario
+        
+        Args:
+            text: Texto a analizar
+            
+        Returns:
+            Diccionario con listas de términos encontrados
+        """
+        if pd.isna(text) or text.strip() == "":
+            return {dict_name: [] for dict_name in self.patterns.keys()}
+        
+        matched_terms = {}
+        text_lower = text.lower()
+        
+        for dict_name, pattern in self.patterns.items():
+            matches = pattern.findall(text_lower)
+            matched_terms[dict_name] = list(set(matches))  # Remover duplicados
+        
+        return matched_terms
+    
+    def analyze_dictionary_coverage(self, texts: List[str]) -> pd.DataFrame:
+        """
+        Analiza la cobertura de cada diccionario en el corpus
+        
+        Args:
+            texts: Lista de textos
+            
+        Returns:
+            DataFrame con estadísticas de cobertura
+        """
+        logger.info("Analizando cobertura de diccionarios...")
+        
+        stats = []
+        
+        for dict_name in self.patterns.keys():
+            texts_with_terms = 0
+            total_terms = 0
+            unique_terms = set()
+            
+            for text in texts:
+                features = self.extract_dictionary_features(text)
+                terms_count = features[f'{dict_name}_terms']
+                
+                if terms_count > 0:
+                    texts_with_terms += 1
+                    total_terms += terms_count
+                    
+                    # Obtener términos únicos
+                    matched = self.get_matched_terms(text)
+                    unique_terms.update(matched[dict_name])
+            
+            stats.append({
+                'dictionary': dict_name,
+                'texts_with_terms': texts_with_terms,
+                'coverage_percentage': (texts_with_terms / len(texts)) * 100,
+                'total_term_occurrences': total_terms,
+                'unique_terms_found': len(unique_terms),
+                'avg_terms_per_text': total_terms / max(texts_with_terms, 1)
             })
+        
+        return pd.DataFrame(stats).sort_values('coverage_percentage', ascending=False)
+
+
+class ClinicalTrialEnrichment:
+    """
+    Enriquecimiento específico para términos de ensayos clínicos
+    """
     
-    return pd.DataFrame(comparison)
+    def __init__(self):
+        """
+        Inicializa términos específicos de ensayos clínicos
+        """
+        self.trial_phases = {
+            'phase 0', 'phase i', 'phase ii', 'phase iii', 'phase iv',
+            'preclinical', 'clinical trial', 'randomized controlled trial',
+            'double blind', 'placebo controlled', 'crossover study'
+        }
+        
+        self.trial_outcomes = {
+            'primary endpoint', 'secondary endpoint', 'efficacy',
+            'safety', 'tolerability', 'adverse event', 'serious adverse event',
+            'dose limiting toxicity', 'maximum tolerated dose',
+            'objective response rate', 'progression free survival',
+            'overall survival', 'quality of life'
+        }
+        
+        self.regulatory_terms = {
+            'fda approval', 'ema approval', 'breakthrough designation',
+            'orphan drug designation', 'fast track', 'accelerated approval',
+            'priority review', 'compassionate use', 'expanded access'
+        }
+    
+    def extract_trial_features(self, text: str) -> Dict[str, int]:
+        """
+        Extrae features específicas de ensayos clínicos
+        
+        Args:
+            text: Texto a analizar
+            
+        Returns:
+            Diccionario con features de ensayos clínicos
+        """
+        if pd.isna(text):
+            text = ""
+        
+        text_lower = text.lower()
+        
+        features = {}
+        
+        # Conteo de términos por categoría
+        for category, terms in [
+            ('trial_phase', self.trial_phases),
+            ('trial_outcome', self.trial_outcomes),
+            ('regulatory', self.regulatory_terms)
+        ]:
+            count = sum(1 for term in terms if term in text_lower)
+            features[f'{category}_terms'] = count
+        
+        # Detección de números de ensayos clínicos (patrón NCT)
+        nct_pattern = r'NCT\d{8}'
+        nct_matches = re.findall(nct_pattern, text, re.IGNORECASE)
+        features['clinical_trial_ids'] = len(nct_matches)
+        
+        # Detección de códigos de protocolo
+        protocol_pattern = r'protocol\s+\w+[-\w]*'
+        protocol_matches = re.findall(protocol_pattern, text, re.IGNORECASE)
+        features['protocol_codes'] = len(protocol_matches)
+        
+        return features
